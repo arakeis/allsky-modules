@@ -8,3 +8,4 @@ adafruit-circuitpython-ahtx0
 barbudor-circuitpython-ina3221
 requests
 meteocalc
+DS18B20dvr

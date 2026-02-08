@@ -37,12 +37,100 @@ from adafruit_htu21d import HTU21D
 from meteocalc import heat_index
 from meteocalc import dew_point
 from digitalio import DigitalInOut, Direction, Pull
+from pathlib import Path
+from DS18B20dvr.DS18B20 import DS18B20
+
+
+class SysPWMException(Exception):
+    pass
+
+
+class SysPWM(object):
+    chippath_base = "/sys/class/pwm/pwmchip"
+
+    def __init__(self, chip, pwm):
+        self.retry = 5
+        self.pwm = int(pwm)
+        self.chippath = f"{self.chippath_base}{int(chip)}"
+        self.pwmdir = f"{self.chippath}/pwm{self.pwm}"
+        self.period_ns = None
+
+        if not self.overlay_loaded():
+            raise SysPWMException("Need to add 'dtoverlay=pwm-2chan' to /boot/firmware/config.txt and reboot")
+        if not self.export_writable():
+            raise SysPWMException(f"Need write access to files in '{self.chippath}'")
+        if not self.pwmX_exists():
+            self.create_pwmX()
+
+    def overlay_loaded(self):
+        return os.path.isdir(self.chippath)
+
+    def export_writable(self):
+        return os.access(f"{self.chippath}/export", os.W_OK)
+
+    def pwmX_exists(self):
+        return os.path.isdir(self.pwmdir)
+
+    def echo(self, m, fil):
+        gotValue = False
+        retry = self.retry
+        while not gotValue and retry > 0:
+            try:
+                with open(fil, 'w') as f:
+                    f.write(f"{m}\n")
+                gotValue = True
+            except Exception:
+                time.sleep(1)
+            retry -= 1
+        if not gotValue:
+            try:
+                with open(fil, 'w') as f:
+                    f.write(f"{m}\n")
+                gotValue = True
+            except Exception as e:
+                s.log(0, f"ERROR: Unable to open {fil} - {e} (arg={m})")
+        return gotValue
+
+    def create_pwmX(self):
+        pwmexport = f"{self.chippath}/export"
+        self.echo(self.pwm, pwmexport)
+
+    def enable(self, disable=False):
+        enable = f"{self.pwmdir}/enable"
+        num = 0 if disable else 1
+        self.echo(num, enable)
+
+    def disable(self):
+        return self.enable(disable=True)
+
+    def set_period_ns(self, period_ns):
+        self.period_ns = int(period_ns)
+        period = f"{self.pwmdir}/period"
+        self.echo(self.period_ns, period)
+
+    def set_frequency(self, hz):
+        hz = float(hz)
+        if hz <= 0:
+            raise SysPWMException("PWM frequency must be > 0")
+        period_ns = int(1_000_000_000 / hz)
+        self.set_period_ns(period_ns)
+
+    def set_duty_ns(self, duty_ns):
+        duty_cycle = f"{self.pwmdir}/duty_cycle"
+        self.echo(int(duty_ns), duty_cycle)
+
+    def set_duty_percent(self, percent):
+        if self.period_ns is None:
+            raise SysPWMException("PWM period not set")
+        percent = max(0.0, min(100.0, float(percent)))
+        duty_ns = int(self.period_ns * (percent / 100.0))
+        self.set_duty_ns(duty_ns)
     
 metaData = {
     "name": "Sky Dew Heater Control",
     "description": "Controls a dew heater via a temperature and humidity sensor",
     "module": "allsky_dewheater",
-    "version": "v1.0.6",
+    "version": "v1.0.9",
     "events": [
         "periodic"
     ],
@@ -53,6 +141,14 @@ metaData = {
         "heaterpin": "",
         "extrapin": "",
         "i2caddress": "",
+        "ds18b20address": "",
+        "useowhumidity": "False",
+        "controlmode": "OnOff",
+        "pwmchip": "2",
+        "pwmchannel": "0",
+        "pwmfrequency": "1000",
+        "pwmmin": "0",
+        "pwmmax": "100",
         "heaterstartupstate": "OFF",
         "invertrelay": "False",
         "invertextrapin": "False",
@@ -81,7 +177,7 @@ metaData = {
             "tab": "Sensor",
             "type": {
                 "fieldtype": "select",
-                "values": "None,SHT31,SHT4x,DHT22,DHT11,AM2302,BME280-I2C,HTU21,AHTx0,SOLO-Cloudwatcher,OpenWeather",
+                "values": "None,SHT31,SHT4x,DHT22,DHT11,AM2302,BME280-I2C,HTU21,AHTx0,DS18B20,SOLO-Cloudwatcher,OpenWeather",
                 "default": "None"
             }
         },
@@ -99,6 +195,80 @@ metaData = {
             "description": "I2C Address",
             "help": "Override the standard i2c address for a device. NOTE: This value must be hex i.e. 0x76",
             "tab": "Sensor"
+        },
+        "ds18b20address": {
+            "required": "false",
+            "description": "DS18B20 Address",
+            "tab": "Sensor",
+            "help": "Filename in /sys/bus/w1/devices"
+        },
+        "useowhumidity": {
+            "required": "false",
+            "description": "Use OpenWeather Humidity",
+            "help": "When using DS18B20, read humidity from OpenWeather to compute dew point with local temperature",
+            "tab": "OpenWeather",
+            "type": {
+                "fieldtype": "checkbox"
+            }
+        },
+        "controlmode" : {
+            "required": "false",
+            "description": "Control Mode",
+            "help": "Choose On/Off control or PWM control via sysfs",
+            "tab": "Heater",
+            "type": {
+                "fieldtype": "select",
+                "values": "OnOff,PWM",
+                "default": "OnOff"
+            }
+        },
+        "pwmchip": {
+            "required": "false",
+            "description": "PWM Chip",
+            "help": "PWM chip number under /sys/class/pwm (e.g. 2 for /sys/class/pwm/pwmchip2)",
+            "tab": "Heater"
+        },
+        "pwmchannel": {
+            "required": "false",
+            "description": "PWM Channel",
+            "help": "PWM channel under the chip (e.g. 0 or 1)",
+            "tab": "Heater"
+        },
+        "pwmfrequency": {
+            "required": "false",
+            "description": "PWM Frequency (Hz)",
+            "help": "PWM frequency in Hz",
+            "tab": "Heater",
+            "type": {
+                "fieldtype": "spinner",
+                "min": 1,
+                "max": 20000,
+                "step": 1
+            }
+        },
+        "pwmmin": {
+            "required": "false",
+            "description": "PWM Min Duty (%)",
+            "help": "Minimum duty cycle percentage",
+            "tab": "Heater",
+            "type": {
+                "fieldtype": "spinner",
+                "min": 0,
+                "max": 100,
+                "step": 1
+            }
+        },
+        "pwmmax": {
+            "required": "false",
+            "description": "PWM Max Duty (%)",
+            "help": "Maximum duty cycle percentage",
+            "tab": "Heater",
+            "type": {
+                "fieldtype": "spinner",
+                "min": 0,
+                "max": 100,
+                "step": 1
+            }
         },
         "dhtxxretrycount" : {
             "required": "false",
@@ -362,6 +532,27 @@ metaData = {
                 "author": "Alex Greenland",
                 "authorurl": "https://github.com/allskyteam",
                 "changes": "Added option to disable heater during the day"
+            }
+        ],
+        "v1.0.7" : [
+            {
+                "author": "Alex Greenland",
+                "authorurl": "https://github.com/allskyteam",
+                "changes": "Added DS18B20 support"
+            }
+        ],
+        "v1.0.8" : [
+            {
+                "author": "Alex Greenland",
+                "authorurl": "https://github.com/allskyteam",
+                "changes": "Allow DS18B20 to use OpenWeather humidity for dew point calculation"
+            }
+        ],
+        "v1.0.9" : [
+            {
+                "author": "Alex Greenland",
+                "authorurl": "https://github.com/allskyteam",
+                "changes": "Added PWM control mode via sysfs"
             }
         ]                                      
     }
@@ -794,6 +985,28 @@ def readAHTX0(i2caddress):
 
     return temperature, humidity
 
+def readDS18B20(address):
+    humidity = None
+    temperature = None
+
+    one_wire_base_dir = Path('/sys/bus/w1/devices/')
+    one_wire_sensor_dir = Path(os.path.join(one_wire_base_dir, address))
+
+    if one_wire_base_dir.is_dir():
+        if one_wire_sensor_dir.is_dir():
+            try:
+                device = DS18B20(address)
+                temperature = device.read_temperature()
+            except Exception as ex:
+                _, _, trace_back = sys.exc_info()
+                s.log(4, f"ERROR: Module readDS18B20 failed on line {trace_back.tb_lineno} - {ex}")
+        else:
+            s.log(4,f'ERROR: (readDS18B20) - "{address}" is not a valid DS18B20 address. Please check /sys/bus/w1/devices')
+    else:
+        s.log(4,'ERROR: (readDS18B20) - One Wire is not enabled. Please use the raspi-config utility to enable it')
+
+    return temperature, humidity
+
 def readSolo(url):
     temperature = None
     humidity = None
@@ -841,6 +1054,50 @@ def readSolo(url):
             
     return temperature, humidity, pressure, dewPoint
 
+
+_pwm_device = None
+_pwm_config = None
+
+
+def clamp(value, min_value, max_value):
+    return max(min_value, min(max_value, value))
+
+
+def ensure_pwm_device(pwmchip, pwmchannel, pwmfrequency):
+    global _pwm_device, _pwm_config
+    config = (int(pwmchip), int(pwmchannel), int(pwmfrequency))
+    if _pwm_device is None or _pwm_config != config:
+        _pwm_device = SysPWM(config[0], config[1])
+        _pwm_device.set_frequency(config[2])
+        _pwm_device.set_duty_percent(0)
+        _pwm_device.enable()
+        _pwm_config = config
+        s.log(1, f"INFO: PWM enabled on pwmchip{config[0]} pwm{config[1]} @ {config[2]}Hz")
+    return _pwm_device
+
+
+def set_pwm_duty(pwmchip, pwmchannel, pwmfrequency, duty_percent):
+    pwm = ensure_pwm_device(pwmchip, pwmchannel, pwmfrequency)
+    pwm.set_duty_percent(duty_percent)
+
+
+def compute_pwm_duty(temperature, dewPoint, limit, force, pwmmin, pwmmax):
+    if temperature is None:
+        return 0
+    if force != 0 and temperature <= force:
+        return pwmmax
+    if dewPoint is None:
+        return 0
+    delta = temperature - dewPoint
+    if limit <= 0:
+        return pwmmax if delta <= 0 else pwmmin
+    if delta <= 0:
+        return pwmmax
+    if delta >= limit:
+        return pwmmin
+    ratio = (limit - delta) / limit
+    return pwmmin + ratio * (pwmmax - pwmmin)
+
 def turnHeaterOn(heaterpin, invertrelay, extra=False):
     if extra:
         type = 'Extra'
@@ -880,7 +1137,7 @@ def turnHeaterOff(heaterpin, invertrelay, extra=False):
         s.dbDeleteKey("dewheaterontime")
     s.log(1,f"INFO: {result}")
 
-def getSensorReading(sensorType, inputpin, i2caddress, dhtxxretrycount, dhtxxdelay, sht31heater, soloURL, sht41mode, params):
+def getSensorReading(sensorType, inputpin, i2caddress, ds18b20address, useowhumidity, dhtxxretrycount, dhtxxdelay, sht31heater, soloURL, sht41mode, params):
     temperature = None
     humidity = None
     dewPoint = None
@@ -901,6 +1158,21 @@ def getSensorReading(sensorType, inputpin, i2caddress, dhtxxretrycount, dhtxxdel
         temperature, humidity = readHtu21(i2caddress)
     elif sensorType == "AHTx0":
         temperature, humidity = readAHTX0(i2caddress)
+    elif sensorType == "DS18B20":
+        temperature, humidity = readDS18B20(ds18b20address)
+        if useowhumidity:
+            apikey = params.get("apikey", "")
+            fileName = params.get("filename", "")
+            if apikey == "" or fileName == "":
+                s.log(4,"INFO: OpenWeather humidity enabled but API key or filename missing; skipping OpenWeather read")
+            else:
+                _, ow_humidity, ow_pressure, _ = readOpenWeather(params)
+                if ow_humidity is not None:
+                    humidity = ow_humidity
+                    pressure = ow_pressure
+                    s.log(4,"INFO: Using OpenWeather humidity for DS18B20 dew point calculation")
+                else:
+                    s.log(4,"WARNING: OpenWeather humidity not available; dew point will not be computed")
     elif sensorType == "SOLO-Cloudwatcher":
         temperature, humidity, pressure, dewPoint = readSolo(soloURL)
     elif sensorType == 'OpenWeather':
@@ -908,11 +1180,10 @@ def getSensorReading(sensorType, inputpin, i2caddress, dhtxxretrycount, dhtxxdel
     else:
         s.log(0,"ERROR: No sensor type defined")
 
+    tempUnits = s.getSetting("temptype")
     if temperature is not None and humidity is not None:
         dewPoint = dew_point(temperature, humidity).c
         heatIndex = heat_index(temperature, humidity).c
-
-        tempUnits = s.getSetting("temptype")
         if tempUnits == 'F':
             temperature = (temperature * (9/5)) + 32
             dewPoint = (dewPoint * (9/5)) + 32
@@ -923,6 +1194,10 @@ def getSensorReading(sensorType, inputpin, i2caddress, dhtxxretrycount, dhtxxdel
         humidity = round(humidity, 2)
         dewPoint = round(dewPoint, 2)
         heatIndex = round(heatIndex, 2)
+    else:
+        if temperature is not None and tempUnits == 'F':
+            temperature = (temperature * (9/5)) + 32
+            s.log(4,"INFO: Converted temperature ONLY to F")
 
     return temperature, humidity, dewPoint, heatIndex, pressure, relHumidity, altitude
 
@@ -941,6 +1216,7 @@ def dewheater(params, event):
     result = ""
     sensorType = params["type"]
     heaterstartupstate = params["heaterstartupstate"]
+    controlmode = params.get("controlmode", "OnOff")
     try:
         heaterpin = int(params["heaterpin"])
     except ValueError:
@@ -960,11 +1236,38 @@ def dewheater(params, event):
     frequency = int(params["frequency"])
     maxontime = int(params["max"])
     i2caddress = params["i2caddress"]
+    ds18b20address = params["ds18b20address"]
     dhtxxretrycount = int(params["dhtxxretrycount"])
     dhtxxdelay = int(params["dhtxxdelay"])
     extradatafilename = params['extradatafilename']
     sht31heater = params["sht31heater"]
     sht41mode = params["sht41mode"]
+    useowhumidity = params["useowhumidity"]
+    try:
+        pwmchip = int(params.get("pwmchip", 2))
+    except ValueError:
+        pwmchip = 2
+    try:
+        pwmchannel = int(params.get("pwmchannel", 0))
+    except ValueError:
+        pwmchannel = 0
+    try:
+        pwmfrequency = int(params.get("pwmfrequency", 1000))
+    except ValueError:
+        pwmfrequency = 1000
+    try:
+        pwmmin = int(params.get("pwmmin", 0))
+    except ValueError:
+        pwmmin = 0
+    try:
+        pwmmax = int(params.get("pwmmax", 100))
+    except ValueError:
+        pwmmax = 100
+    pwmmin = clamp(pwmmin, 0, 100)
+    pwmmax = clamp(pwmmax, 0, 100)
+    if pwmmin > pwmmax:
+        s.log(4, "WARNING: PWM min duty > max duty; swapping values")
+        pwmmin, pwmmax = pwmmax, pwmmin
 
     try:
         soloURL = params["solourl"]
@@ -979,6 +1282,7 @@ def dewheater(params, event):
     dewPoint = 0
     heatIndex = 0
     heater = 'Off'
+    pwm_duty = 0
 
     okToRun = True
     if daytimeDisable:
@@ -993,9 +1297,10 @@ def dewheater(params, event):
             except ValueError:
                 heaterpin = 0
 
-            if heaterpin != 0:
-                heaterpin = s.getGPIOPin(heaterpin)
-                if extrapin !=0:
+            if controlmode == "PWM" or heaterpin != 0:
+                if controlmode != "PWM":
+                    heaterpin = s.getGPIOPin(heaterpin)
+                if extrapin != 0:
                     extrapin = s.getGPIOPin(extrapin)
                 lastRunTime = getLastRunTime()
                 if lastRunTime is not None:
@@ -1003,41 +1308,77 @@ def dewheater(params, event):
                     lastRunSecs = now - lastRunTime
                     if lastRunSecs >= frequency:
                         s.dbUpdate("dewheaterlastrun", now)
-                        temperature, humidity, dewPoint, heatIndex, pressure, relHumidity, altitude = getSensorReading(sensorType, inputpin, i2caddress, dhtxxretrycount, dhtxxdelay, sht31heater, soloURL, sht41mode, params)
+                        temperature, humidity, dewPoint, heatIndex, pressure, relHumidity, altitude = getSensorReading(sensorType, inputpin, i2caddress, ds18b20address, useowhumidity, dhtxxretrycount, dhtxxdelay, sht31heater, soloURL, sht41mode, params)
                         if temperature is not None:
                             lastOnSecs = 0
                             if s.dbHasKey("dewheaterontime"):
                                 lastOnTime = s.dbGet("dewheaterontime")
                                 lastOnSecs = now - lastOnTime
-                            if maxontime != 0 and lastOnSecs >= maxontime:
-                                result = "Heater was on longer than maximum allowed time {}".format(maxontime)
-                                s.log(1,"INFO: {}".format(result))
-                                turnHeaterOff(heaterpin, invertrelay)
-                                if extrapin != 0:
-                                    turnHeaterOff(extrapin, invertextrapin, True)
-                                heater = 'Off'
-                            elif force != 0 and temperature <= force:
-                                result = "Temperature below forced level {}".format(force)
-                                s.log(1,"INFO: {}".format(result))
-                                turnHeaterOn(heaterpin, invertrelay)
-                                if extrapin != 0:
-                                    turnHeaterOn(extrapin, invertextrapin, True)
-                                heater = 'On'
-                            else:
-                                if ((temperature-limit) <= dewPoint):
-                                    turnHeaterOn(heaterpin, invertrelay)
-                                    if extrapin != 0:
-                                        turnHeaterOn(extrapin, invertextrapin)
-                                    heater = 'On'
-                                    result = "Temperature within limit temperature {}, limit {}, dewPoint {}".format(temperature, limit, dewPoint)
+                            if controlmode == "PWM":
+                                if maxontime != 0 and lastOnSecs >= maxontime:
+                                    result = "Heater was on longer than maximum allowed time {}".format(maxontime)
                                     s.log(1,"INFO: {}".format(result))
+                                    pwm_duty = 0
                                 else:
-                                    result = "Temperature outside limit temperature {}, limit {}, dewPoint {}".format(temperature, limit, dewPoint)
+                                    pwm_duty = compute_pwm_duty(temperature, dewPoint, limit, force, pwmmin, pwmmax)
+                                    if invertrelay:
+                                        pwm_duty = 100 - pwm_duty
+                                if pwm_duty > 0:
+                                    if not s.dbHasKey("dewheaterontime"):
+                                        s.dbAdd("dewheaterontime", now)
+                                    heater = f"PWM {round(pwm_duty,1)}%"
+                                else:
+                                    if s.dbHasKey("dewheaterontime"):
+                                        s.dbDeleteKey("dewheaterontime")
+                                    heater = 'Off'
+                                try:
+                                    set_pwm_duty(pwmchip, pwmchannel, pwmfrequency, pwm_duty)
+                                except Exception as e:
+                                    eType, eObject, eTraceback = sys.exc_info()
+                                    s.log(0, f"ERROR: PWM control failed on line {eTraceback.tb_lineno} - {e}")
+                                    heater = 'Off'
+                                if extrapin != 0:
+                                    if pwm_duty > 0:
+                                        turnHeaterOn(extrapin, invertextrapin, True)
+                                    else:
+                                        turnHeaterOff(extrapin, invertextrapin, True)
+                            else:
+                                if maxontime != 0 and lastOnSecs >= maxontime:
+                                    result = "Heater was on longer than maximum allowed time {}".format(maxontime)
                                     s.log(1,"INFO: {}".format(result))
                                     turnHeaterOff(heaterpin, invertrelay)
                                     if extrapin != 0:
                                         turnHeaterOff(extrapin, invertextrapin, True)
                                     heater = 'Off'
+                                elif force != 0 and temperature <= force:
+                                    result = "Temperature below forced level {}".format(force)
+                                    s.log(1,"INFO: {}".format(result))
+                                    turnHeaterOn(heaterpin, invertrelay)
+                                    if extrapin != 0:
+                                        turnHeaterOn(extrapin, invertextrapin, True)
+                                    heater = 'On'
+                                else:
+                                    if dewPoint is None:
+                                        result = "No dew point available; use a sensor with humidity or set a forced temperature"
+                                        s.log(1,"INFO: {}".format(result))
+                                        turnHeaterOff(heaterpin, invertrelay)
+                                        if extrapin != 0:
+                                            turnHeaterOff(extrapin, invertextrapin, True)
+                                        heater = 'Off'
+                                    elif ((temperature-limit) <= dewPoint):
+                                        turnHeaterOn(heaterpin, invertrelay)
+                                        if extrapin != 0:
+                                            turnHeaterOn(extrapin, invertextrapin)
+                                        heater = 'On'
+                                        result = "Temperature within limit temperature {}, limit {}, dewPoint {}".format(temperature, limit, dewPoint)
+                                        s.log(1,"INFO: {}".format(result))
+                                    else:
+                                        result = "Temperature outside limit temperature {}, limit {}, dewPoint {}".format(temperature, limit, dewPoint)
+                                        s.log(1,"INFO: {}".format(result))
+                                        turnHeaterOff(heaterpin, invertrelay)
+                                        if extrapin != 0:
+                                            turnHeaterOff(extrapin, invertextrapin, True)
+                                        heater = 'Off'
                                 
                             extraData = {}
                             extraData["AS_DEWCONTROLSENSOR"] = str(sensorType)
@@ -1067,16 +1408,30 @@ def dewheater(params, event):
                     now = int(time.time())
                     s.dbAdd("dewheaterlastrun", now)
                     s.log(1,"INFO: No last run info so assuming startup")
-                    if heaterstartupstate == "ON":
-                        turnHeaterOn(heaterpin, invertrelay)
+                    if controlmode == "PWM":
+                        pwm_duty = pwmmax if heaterstartupstate == "ON" else 0
+                        try:
+                            set_pwm_duty(pwmchip, pwmchannel, pwmfrequency, pwm_duty)
+                        except Exception as e:
+                            eType, eObject, eTraceback = sys.exc_info()
+                            s.log(0, f"ERROR: PWM control failed on line {eTraceback.tb_lineno} - {e}")
+                        heater = f"PWM {round(pwm_duty,1)}%" if pwm_duty > 0 else "Off"
                         if extrapin != 0:
-                            turnHeaterOn(extrapin, invertextrapin)
-                        heater = 'On'
+                            if pwm_duty > 0:
+                                turnHeaterOn(extrapin, invertextrapin, True)
+                            else:
+                                turnHeaterOff(extrapin, invertextrapin, True)
                     else:
-                        turnHeaterOff(heaterpin, invertrelay)
-                        if extrapin != 0:
-                            turnHeaterOff(extrapin, invertextrapin)
-                        heater = 'Off'
+                        if heaterstartupstate == "ON":
+                            turnHeaterOn(heaterpin, invertrelay)
+                            if extrapin != 0:
+                                turnHeaterOn(extrapin, invertextrapin)
+                            heater = 'On'
+                        else:
+                            turnHeaterOff(heaterpin, invertrelay)
+                            if extrapin != 0:
+                                turnHeaterOff(extrapin, invertextrapin)
+                            heater = 'Off'
             else:
                 s.deleteExtraData(extradatafilename)
                 result = "heater pin not defined or invalid"
@@ -1088,9 +1443,16 @@ def dewheater(params, event):
             result = 'Will run in {:.2f} seconds'.format(frequency - diff)
             s.log(1,"INFO: {}".format(result))
     else:
-        if heaterpin != 0:
-            heaterpin = s.getGPIOPin(heaterpin)
-            turnHeaterOff(heaterpin, invertrelay)
+        if controlmode == "PWM":
+            try:
+                set_pwm_duty(pwmchip, pwmchannel, pwmfrequency, 0)
+            except Exception as e:
+                eType, eObject, eTraceback = sys.exc_info()
+                s.log(0, f"ERROR: PWM control failed on line {eTraceback.tb_lineno} - {e}")
+        else:
+            if heaterpin != 0:
+                heaterpin = s.getGPIOPin(heaterpin)
+                turnHeaterOff(heaterpin, invertrelay)
         if extrapin != 0:
             extrapin = s.getGPIOPin(extrapin)
             turnHeaterOff(extrapin, invertextrapin, True)
